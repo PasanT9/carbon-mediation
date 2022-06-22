@@ -18,6 +18,7 @@
 
 package org.wso2.carbon.integrator.core.handler;
 
+import org.apache.axis2.Constants;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.http.protocol.HTTP;
@@ -25,17 +26,22 @@ import org.apache.synapse.AbstractSynapseHandler;
 import org.apache.synapse.MessageContext;
 import org.apache.synapse.SynapseException;
 import org.apache.synapse.core.axis2.Axis2MessageContext;
-import org.apache.synapse.core.axis2.Axis2Sender;
 import org.apache.synapse.mediators.builtin.SendMediator;
+import org.apache.synapse.transport.passthru.PassThroughConstants;
 import org.apache.synapse.transport.passthru.core.PassThroughSenderManager;
+import org.apache.synapse.transport.passthru.util.RelayUtils;
+import org.wso2.carbon.dataservices.core.odata.ODataServiceHandler;
+import org.wso2.carbon.dataservices.core.odata.ODataServiceRegistry;
 import org.wso2.carbon.integrator.core.Utils;
-import org.wso2.carbon.webapp.mgt.WebApplication;
 
+import java.io.IOException;
 import java.util.Set;
 import java.util.TreeMap;
+import javax.xml.stream.XMLStreamException;
 
 /**
- * This handler is written to dispatch messages to tomcat servlet transport.
+ * This handler is written to process incoming messages to the passthrough endpoint.
+ *
  */
 public class IntegratorSynapseHandler extends AbstractSynapseHandler {
 
@@ -49,8 +55,9 @@ public class IntegratorSynapseHandler extends AbstractSynapseHandler {
     private PassThroughSenderManager passThroughSenderManager = PassThroughSenderManager.getInstance();
 
     private static final String MESSAGE_DISPATCHED = "MessageDispatched";
-
     private static final String RESPONSE_WRITTEN = "RESPONSE_WRITTEN";
+    private static final String SUPER_TENANT_DOMAIN_NAME = "carbon.super";
+    private static final int NOT_IMPLEMENTED = 501;
 
     @Override
     public boolean handleRequestInFlow(MessageContext messageContext) {
@@ -60,27 +67,19 @@ public class IntegratorSynapseHandler extends AbstractSynapseHandler {
                     ((Axis2MessageContext) messageContext).getAxis2MessageContext();
             Object isODataService = axis2MessageContext.getProperty("IsODataService");
             // In this if block we are skipping proxy services, inbound related message contexts & api.
-            if (axis2MessageContext.getProperty("TransportInURL") != null && isODataService != null ) {
-                String uri = axis2MessageContext.getProperty("TransportInURL").toString();
-                //OData web apps related logic
-                WebApplication webApplication = Utils.getStartedWebapp(uri);
-                if (webApplication != null) {
-                    String protocol = (String) messageContext.getProperty("TRANSPORT_IN_NAME");
-                    String host;
-                    Object headers = axis2MessageContext.getProperty("TRANSPORT_HEADERS");
-                    if (headers instanceof TreeMap) {
-                        host = Utils.getHostname((String) ((TreeMap) headers).get("Host"));
-                        isPreserveHeadersContained = true;
-                        String endpoint = protocol + "://" + host + ":" + Utils.getProtocolPort(protocol);
-                        return dispatchMessage(endpoint, uri, messageContext);
-                    }
-                }
+            if (axis2MessageContext.getProperty("TransportInURL") != null && isODataService != null) {
+                RelayUtils.buildMessage(axis2MessageContext);
+                ODataServletRequest request = new ODataServletRequest(axis2MessageContext);
+                ODataServletResponse response = new ODataServletResponse(axis2MessageContext);
+                initProcess(request, response);
+                streamResponseBack(response, messageContext);
             }
             return true;
         } catch (Exception e) {
             this.handleException("Error occurred in integrator handler.", e, messageContext);
             return true;
-        } finally {
+        }
+        finally {
             if (isPreserveHeadersContained) {
                 if (passThroughSenderManager != null &&
                         passThroughSenderManager.getSharedPassThroughHttpSender() != null) {
@@ -100,9 +99,94 @@ public class IntegratorSynapseHandler extends AbstractSynapseHandler {
         }
     }
 
+    /**
+     * This method initiates processing the servlet request.
+     *
+     * @param request
+     * @param response
+     */
+    private void initProcess(ODataServletRequest request, ODataServletResponse response) {
+        String[] serviceParams = request.getRequestURI().split("/odata/")[1].split("/");
+        String domain = "";
+        String serviceRootPath = "";
+        String serviceKey = "";
+        if (serviceParams[0].equals("t")) {
+            domain = serviceParams[1];
+            serviceRootPath = "/" + serviceParams[2] + "/" + serviceParams[3];
+            serviceKey = serviceParams[2] + serviceParams[3];
+        } else {
+            domain = SUPER_TENANT_DOMAIN_NAME;
+            serviceRootPath = "/" + serviceParams[0] + "/" + serviceParams[1];
+            serviceKey = serviceParams[0] + serviceParams[1];
+        }
+        ODataServiceRegistry registry = ODataServiceRegistry.getInstance();
+        ODataServiceHandler oDataServiceHandler = registry.getServiceHandler(serviceKey, domain);
+        processServletRequest(request, response, serviceRootPath, oDataServiceHandler);
+    }
+
+    /**
+     * This method will process the servlet request and builds the response.
+     *
+     * @param request
+     * @param response
+     * @param serviceRootPath
+     * @param oDataServiceHandler
+     * @return
+     */
+    private Thread processServletRequest(ODataServletRequest request, ODataServletResponse response,
+                                         String serviceRootPath, ODataServiceHandler oDataServiceHandler) {
+        Thread streamThread = null;
+        if (oDataServiceHandler != null) {
+            streamThread = new Thread() {
+                @Override
+                public void run() {
+                    try {
+                        oDataServiceHandler.process(request, response, serviceRootPath);
+                    } catch (Exception e) {
+                        if (log.isDebugEnabled()) {
+                            log.debug("Failed to process the servlet request.");
+                        }
+                        throw new SynapseException("Error occurred while processing the request.", e);
+                    } finally {
+                        response.close();
+                    }
+                }
+            };
+            streamThread.start();
+        } else {
+            if (log.isDebugEnabled()) {
+                log.debug("Couldn't find the ODataService Handler for " + serviceRootPath + " Service.");
+            }
+            response.setStatus(NOT_IMPLEMENTED);
+            response.close();
+        }
+        return streamThread;
+    }
+
+    /**
+     * This method starts streaming the response from the server to the client.
+     *
+     * @param response
+     * @param messageContext
+     * @throws XMLStreamException
+     * @throws IOException
+     */
+    private void streamResponseBack(ODataServletResponse response, MessageContext messageContext)
+            throws XMLStreamException, IOException {
+        org.apache.axis2.context.MessageContext axis2MessageContext =
+                ((Axis2MessageContext) messageContext).getAxis2MessageContext();
+        axis2MessageContext.setProperty(Constants.Configuration.MESSAGE_TYPE, Utils.TEXT_CONTENT_TYPE);
+        axis2MessageContext.removeProperty(PassThroughConstants.NO_ENTITY_BODY);
+        RelayUtils.buildMessage(axis2MessageContext);
+        messageContext.setTo(null);
+        messageContext.setResponse(true);
+        axis2MessageContext.getOperationContext().setProperty(RESPONSE_WRITTEN, "SKIP");
+        ODataAxisEngine.stream(axis2MessageContext, response);
+    }
+
     @Override
     public boolean handleRequestOutFlow(MessageContext messageContext) {
-        return true;
+        return false;
     }
 
     @Override
@@ -122,13 +206,11 @@ public class IntegratorSynapseHandler extends AbstractSynapseHandler {
                     Utils.rewriteLocationHeader(locationHeader, messageContext);
                 }
             }
-
             messageContext.setTo(null);
             messageContext.setResponse(true);
             Axis2MessageContext axis2smc = (Axis2MessageContext) messageContext;
             org.apache.axis2.context.MessageContext axis2MessageCtx = axis2smc.getAxis2MessageContext();
             axis2MessageCtx.getOperationContext().setProperty(RESPONSE_WRITTEN, "SKIP");
-            Axis2Sender.sendBack(messageContext);
             return false;
         }
         return true;
@@ -145,45 +227,5 @@ public class IntegratorSynapseHandler extends AbstractSynapseHandler {
             msgContext.getServiceLog().error(msg, e);
         }
         throw new SynapseException(msg, e);
-    }
-
-    private void setREST_URL_POSTFIX(org.apache.axis2.context.MessageContext messageContext, String to) {
-        if (messageContext.getProperty("REST_URL_POSTFIX") != null) {
-            if (log.isDebugEnabled()) {
-                log.debug("message's REST_URL_POSTFIX is changing from " +
-                        messageContext.getProperty("REST_URL_POSTFIX") + " to " + to);
-            }
-            messageContext.setProperty("REST_URL_POSTFIX", to);
-        }
-    }
-
-    /**
-     * In this method we are dispatching the message to tomcat transport.
-     *
-     * @param endpoint       Endpoint
-     * @param uri            uri
-     * @param messageContext message context
-     * @return boolean
-     */
-    private boolean dispatchMessage(String endpoint, String uri, MessageContext messageContext) {
-        // Adding preserver Headers
-        if (passThroughSenderManager != null && passThroughSenderManager.getSharedPassThroughHttpSender() != null) {
-            try {
-                passThroughSenderManager.getSharedPassThroughHttpSender().addPreserveHttpHeader(HTTP.USER_AGENT);
-                // This catch is added when there is no preserve headers in the PassthoughHttpSender.
-            } catch (ArrayIndexOutOfBoundsException e) {
-                if (log.isDebugEnabled()) {
-                    log.debug("ArrayIndexOutOfBoundsException exception occurred, when adding preserve headers.");
-                }
-            }
-        }
-        if (log.isDebugEnabled()) {
-            log.debug("Dispatching message to " + uri);
-        }
-        messageContext.setProperty(MESSAGE_DISPATCHED, "true");
-        Utils.setIntegratorHeader(messageContext, uri);
-        setREST_URL_POSTFIX(((Axis2MessageContext) messageContext).getAxis2MessageContext(), uri);
-        sendMediator.setEndpoint(Utils.createEndpoint(endpoint, messageContext.getEnvironment()));
-        return sendMediator.mediate(messageContext);
     }
 }

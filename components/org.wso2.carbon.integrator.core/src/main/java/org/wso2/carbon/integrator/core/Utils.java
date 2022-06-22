@@ -65,6 +65,10 @@ public class Utils {
     private static OMElement endpoint = fac.createOMElement(ENDPOINT_Q);
     private static OMElement address = fac.createOMElement(ADDRESS_Q);
     private static OMElement axis2Config;
+    public final static String JSON_CONTENT_TYPE = "application/json";
+    public final static String XML_CONTENT_TYPE = "application/xml";
+    public final static String TEXT_CONTENT_TYPE = "text/plain";
+    public final static int NO_CONTENT = 204;
 
     public static int getProtocolPort(String protocol) {
         CarbonTomcatService webAppAdminService;
